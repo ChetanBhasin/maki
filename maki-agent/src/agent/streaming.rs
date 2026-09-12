@@ -107,10 +107,10 @@ impl From<StreamError> for AgentError {
 /// effort level the user picked arrives cut down unless twice its budget fits
 /// here. On a high level that is most of the model's output cap.
 ///
-/// The window clamp at the end is a backstop. Compaction reserves at least
-/// [`min_output`] ([`compaction::reserved`]), so a session that compacts on
-/// schedule only meets it when the thinking reservation is what crowds the
-/// window, and then the ceiling walks the thinking back down.
+/// The window clamp at the end is a backstop. Compaction reserves [`min_output`]
+/// where the window can spare it ([`compaction::reserved`]), so a session that
+/// compacts on schedule only meets it when the thinking reservation is what
+/// crowds the window, and then the ceiling walks the thinking back down.
 ///
 /// A model that declares no cap still gets a budget: "let the provider pick" is
 /// unbounded on the servers that most need bounding (llama.cpp hands over the

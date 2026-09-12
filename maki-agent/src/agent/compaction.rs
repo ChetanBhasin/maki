@@ -26,6 +26,19 @@ const RECENT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
 /// budget would reserve tens of thousands it cannot use, on the one request
 /// already sent under the most context pressure a session ever sees.
 const SUMMARY_OUTPUT_BUDGET: u32 = 16_384;
+/// Ceiling on everything [`reserved`] holds back, as a share of the window.
+///
+/// The floor under a reservation is a fixed token count and the buffer can be
+/// written as one, so on a small window either can reach the whole context. A
+/// reservation that large leaves no usable window at all: every turn reads as
+/// an overflow, and compaction cannot get under a threshold of zero, so a
+/// llama.cpp server started with `n_ctx 4096` summarized itself before every
+/// single turn.
+const MAX_RESERVED_PERCENT: u32 = 50;
+
+fn percent_of(tokens: u32, percent: u32) -> u32 {
+    (u64::from(tokens) * u64::from(percent) / 100) as u32
+}
 
 fn normalize(text: Option<&str>) -> Option<&str> {
     text.map(str::trim).filter(|t| !t.is_empty())
@@ -248,15 +261,26 @@ pub async fn compact(
 /// Reserving a whole [`AgentConfig::max_turn_output`] would guarantee more and
 /// cost more: on a small window that is half the context, and compacting that
 /// early hurts worse than the odd turn whose output budget gets trimmed.
+///
+/// Whatever the floor and the buffer work out to, [`MAX_RESERVED_PERCENT`] has
+/// the last word, because a reservation that eats the window leaves compaction
+/// nothing to compact into.
 pub(super) fn reserved(model: &Model, config: &AgentConfig) -> u32 {
     config
         .compaction_buffer
         .resolve(model.context_window)
         .max(min_output(model))
+        .min(percent_of(model.context_window, MAX_RESERVED_PERCENT))
+}
+
+/// What [`reserved`] leaves the transcript. Always a real number of tokens, so
+/// `>=` against it is a threshold a session can sit below.
+pub(super) fn usable(model: &Model, config: &AgentConfig) -> u32 {
+    model.context_window - reserved(model, config)
 }
 
 pub(super) fn is_overflow(context_tokens: u32, model: &Model, config: &AgentConfig) -> bool {
-    context_tokens >= model.context_window.saturating_sub(reserved(model, config))
+    context_tokens >= usable(model, config)
 }
 
 fn strip_images(messages: &mut [Message]) {
@@ -741,6 +765,11 @@ mod tests {
     #[test_case(262_144, 0,       0,       0,      262_144, true  ; "equal_context_and_max_output")]
     #[test_case(51_199,  0,       0,       0,      64_000,  false ; "small_window_below_scaled_threshold")]
     #[test_case(51_200,  0,       0,       0,      64_000,  true  ; "small_window_at_scaled_threshold")]
+    // The output floor alone is the whole window here, so without a ceiling on
+    // the reservation every one of these would overflow on an empty transcript.
+    #[test_case(2_047,   0,       0,       0,      4_096,   false ; "llama_cpp_default_window_is_usable")]
+    #[test_case(2_048,   0,       0,       0,      4_096,   true  ; "llama_cpp_default_window_still_compacts")]
+    #[test_case(0,       0,       0,       0,      1_024,   false ; "an_empty_transcript_never_overflows")]
     fn overflow_detection(
         input: u32,
         cache_read: u32,
