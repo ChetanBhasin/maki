@@ -19,7 +19,7 @@ use flume::{Sender, WeakSender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
-use maki_agent::permissions::PermissionAnswer;
+use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
@@ -62,7 +62,13 @@ struct Pending {
 /// How to read the answer and who gets it. A subagent's permission carries the
 /// channel its own agent waits on, everything else answers the main agent.
 enum Ask {
-    Permission(Option<Sender<String>>),
+    /// `request_id` is the agent-side id of the ask the tool is parked on, not
+    /// the JSON-RPC id and not the client-facing tool call: the answer is
+    /// tagged with it so a waiter on any other ask refuses it.
+    Permission {
+        request_id: String,
+        answer_tx: Option<Sender<String>>,
+    },
     Elicitation,
 }
 
@@ -752,7 +758,13 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
         return;
     };
     let (answer, answer_tx) = match &ask {
-        Ask::Permission(answer_tx) => (permission_answer(raw).encode(), answer_tx.as_ref()),
+        Ask::Permission {
+            request_id,
+            answer_tx,
+        } => (
+            TaggedAnswer::new(request_id.clone(), permission_answer(raw)).encode(),
+            answer_tx.as_ref(),
+        ),
         // The waiting question tool parses this; an error response decodes to
         // nothing and counts as a dismissal.
         Ask::Elicitation => (
@@ -864,6 +876,7 @@ fn start_event_pump(
                     // this cache, so its permission rides on the `task` call
                     // the client can see, only the child's channel may take the
                     // answer, and the title is all the dialog gets.
+                    let request_id = id.clone();
                     let (id, title, answer_tx) = match subagent {
                         Some(info) => {
                             let Some(answer_tx) = info.answer_tx else {
@@ -894,7 +907,15 @@ fn start_event_pump(
                             ),
                             permissions::permission_options(project_trusted),
                         ));
-                    ask_client(&out_tx, &pending, Ask::Permission(answer_tx), request);
+                    ask_client(
+                        &out_tx,
+                        &pending,
+                        Ask::Permission {
+                            request_id,
+                            answer_tx,
+                        },
+                        request,
+                    );
                     continue;
                 }
                 _ if subagent.is_some() => continue,
@@ -973,8 +994,11 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::permissions::PermissionManager;
-    use maki_agent::{DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent};
+    use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
+    use maki_agent::tools::PermissionScopes;
+    use maki_agent::{
+        CancelToken, DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent,
+    };
     use maki_config::project::TrustQuestion;
     use maki_config::{Effect, ToolKey, TrustFileConfig};
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
@@ -1004,6 +1028,12 @@ mod tests {
     const POLICY_MATCH_GLOB: &str = "**";
     const POLICY_MISS_GLOB: &str = "/nowhere/*";
     const GATED_INIT_SOURCE: &str = "return {}";
+    /// The tool a later turn asks about. Nothing allows `bash` by default, so
+    /// an `Ok` here can only come from an answer that was applied.
+    const NEXT_TURN_TOOL: &str = "bash";
+    const NEXT_TURN_SCOPE: &str = "rm -rf /";
+    const NEXT_TURN_TOOL_USE_ID: &str = "toolu_next_turn";
+    const STALE_ALLOW: &str = "a stale answer must never allow the next turn's tool";
 
     /// The client picks the session cwd, so that folder's stored trust decides
     /// whether its `.maki` may widen permissions. Its deny rules need no trust:
@@ -1232,6 +1262,13 @@ mod tests {
             .pending
     }
 
+    fn permission_ask(answer_tx: Option<Sender<String>>) -> Ask {
+        Ask::Permission {
+            request_id: PARENT_TOOL_USE_ID.to_owned(),
+            answer_tx,
+        }
+    }
+
     fn server_with_ask(ask: Ask) -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
         let (server, answer_rx, out_rx) = test_server();
         pending(&server)
@@ -1399,12 +1436,18 @@ mod tests {
             );
         }
         let child_rx = children.map(|(_, rx)| rx);
-        for (rx, expected) in child_rx.iter().chain([&main_rx]).zip([
-            PermissionAnswer::Deny,
-            PermissionAnswer::AllowOnce,
-            PermissionAnswer::AllowSession,
-        ]) {
-            assert_eq!(rx.try_recv().ok(), (!cancel).then(|| expected.encode()));
+        for ((rx, expected), asked_id) in child_rx
+            .iter()
+            .chain([&main_rx])
+            .zip([
+                PermissionAnswer::Deny,
+                PermissionAnswer::AllowOnce,
+                PermissionAnswer::AllowSession,
+            ])
+            .zip(CHILD_TOOL_USE_IDS.iter().chain([&PARENT_TOOL_USE_ID]))
+        {
+            let expected = TaggedAnswer::new(*asked_id, expected).encode();
+            assert_eq!(rx.try_recv().ok(), (!cancel).then_some(expected));
             assert!(rx.is_empty(), "each answer is delivered only once");
         }
     }
@@ -1430,6 +1473,110 @@ mod tests {
             pending(&srv).lock().unwrap().asks.is_empty(),
             "nothing is left waiting for an answer"
         );
+    }
+
+    /// Runs one permission wait the way a turn does, on the session's own
+    /// answer channel. Whatever is queued when this is called is what the
+    /// waiter finds, which is the shape of the bug: answers outlive the turn
+    /// that asked for them.
+    fn wait_for_permission(
+        srv: &Server,
+        answer_rx: &flume::Receiver<String>,
+        request_id: &str,
+    ) -> Result<(), PermissionError> {
+        let session = srv.session.as_ref().expect("a session is installed");
+        let (guard, _events) = maki_agent::event_stream();
+        let event_tx = guard.sender(0);
+        let rx = async_lock::Mutex::new(answer_rx.clone());
+        smol::block_on(session.handle.permissions.enforce(
+            &ToolKey::native(NEXT_TURN_TOOL),
+            &PermissionScopes::single(NEXT_TURN_SCOPE.to_owned()),
+            &event_tx,
+            Some(&rx),
+            request_id,
+            &CancelToken::none(),
+            None,
+        ))
+    }
+
+    fn queue_answer(srv: &Server, request_id: &str, answer: PermissionAnswer) {
+        let session = srv.session.as_ref().expect("a session is installed");
+        session
+            .handle
+            .answer_tx
+            .send(TaggedAnswer::new(request_id, answer).encode())
+            .unwrap();
+    }
+
+    fn next_turn_is_allowed(srv: &Server) -> bool {
+        let session = srv.session.as_ref().expect("a session is installed");
+        matches!(
+            session.handle.permissions.check(
+                &ToolKey::native(NEXT_TURN_TOOL),
+                NEXT_TURN_SCOPE,
+                None
+            ),
+            PermissionCheck::Allowed
+        )
+    }
+
+    /// The race the ids exist for: the cancel lands while the permission
+    /// envelope is still queued in the pump, so the pump registers a fresh ask
+    /// after `asks` was cleared and the client answers it for real. With
+    /// nobody parked, that answer waits in the channel for the next turn.
+    #[test]
+    fn an_answer_for_a_cancelled_ask_is_not_consumed_by_the_next_turn() {
+        let (srv, answer_rx, out_rx) = test_server();
+        handle_notification(&srv, "session/cancel");
+        run_pump(&srv, None, |sender| {
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+        });
+
+        let request = out_rx.try_recv().expect("the pump still asked the client");
+        handle_incoming_response(
+            &srv,
+            &serde_json::json!({
+                "id": request["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_always"}},
+            }),
+        );
+
+        queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, PermissionAnswer::Deny);
+        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID);
+
+        assert!(outcome.is_err(), "{STALE_ALLOW}");
+        assert!(!next_turn_is_allowed(&srv), "{STALE_ALLOW}");
+        assert!(answer_rx.is_empty(), "the stale answer was dropped, not left");
+    }
+
+    /// A mismatched answer is dropped without ending the wait: the tool is
+    /// still blocked on the ask the user was shown, and only that ask's answer
+    /// may end it.
+    #[test]
+    fn an_answer_naming_another_ask_is_discarded_and_the_wait_continues() {
+        let (srv, answer_rx, ..) = test_server();
+        queue_answer(&srv, PARENT_TOOL_USE_ID, PermissionAnswer::Deny);
+        queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, PermissionAnswer::AllowOnce);
+
+        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID);
+
+        assert!(
+            outcome.is_ok(),
+            "the deny named another ask and must not have ended this wait"
+        );
+        assert!(answer_rx.is_empty(), "both answers were taken off the queue");
+    }
+
+    #[test_case(PermissionAnswer::AllowSession, true ; "allow_applies_the_decision")]
+    #[test_case(PermissionAnswer::Deny, false ; "deny_applies_the_decision")]
+    fn a_matching_answer_is_applied(answer: PermissionAnswer, allowed: bool) {
+        let (srv, answer_rx, ..) = test_server();
+        queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, answer);
+
+        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID);
+
+        assert_eq!(outcome.is_ok(), allowed);
+        assert_eq!(next_turn_is_allowed(&srv), allowed);
     }
 
     /// The close marker rides the same FIFO as the events, so a turn still
@@ -1575,7 +1722,7 @@ mod tests {
 
     #[test]
     fn only_the_outstanding_request_id_is_answered() {
-        let (srv, answer_rx, ..) = server_with_ask(Ask::Permission(None));
+        let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
 
         handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
         assert!(answer_rx.is_empty(), "an unknown id is dropped");
@@ -1583,7 +1730,7 @@ mod tests {
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
         assert_eq!(
             answer_rx.try_recv().ok(),
-            Some(PermissionAnswer::AllowOnce.encode())
+            Some(TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode())
         );
 
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));

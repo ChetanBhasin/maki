@@ -56,7 +56,7 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-use maki_agent::permissions::PermissionManager;
+use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     SharedMessages, SubagentInfo,
@@ -645,7 +645,8 @@ impl App {
         if self.permission_prompt.is_open() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
                 let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
-                let encoded = answer.encode();
+                let request_id = self.permission_prompt.request_id().unwrap_or_default();
+                let encoded = TaggedAnswer::new(request_id, answer).encode();
                 self.permission_prompt.close();
                 self.send_to_agent(subagent_id.as_deref(), encoded);
             }
