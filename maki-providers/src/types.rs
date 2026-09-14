@@ -883,14 +883,18 @@ impl ThinkingConfig {
 
     /// Caps this config at `parent`. A subagent's thinking request is written
     /// by the model, not the user, so it may go down but never above what the
-    /// parent session runs with. `Adaptive` on either side means "let the model
-    /// decide" rather than a ceiling, so it never caps. Both sides compare as
-    /// token budgets, which is the only unit an effort level and an explicit
-    /// count share; the winner keeps its original form either way.
+    /// parent session runs with. A parent of `Adaptive` set no ceiling at all,
+    /// so the child gets whatever it asked for; but against a parent that did
+    /// name a level or a count, a child's `Adaptive` is "let the model decide"
+    /// with no upper bound, which sits above any concrete ceiling, so the
+    /// parent's config wins. Concrete sides compare as token budgets, the only
+    /// unit an effort level and an explicit count share; the winner keeps its
+    /// original form either way.
     pub fn clamp_to(self, parent: Self) -> Self {
         match (parent.budget(None), self.budget(None)) {
             (Budgeted::Off, _) | (_, Budgeted::Off) => Self::Off,
-            (Budgeted::Adaptive, _) | (_, Budgeted::Adaptive) => self,
+            (Budgeted::Adaptive, _) => self,
+            (_, Budgeted::Adaptive) => parent,
             (Budgeted::Tokens(ceiling), Budgeted::Tokens(asked)) => {
                 if asked <= ceiling {
                     self
@@ -1500,8 +1504,12 @@ mod tests {
 
     #[test_case(ThinkingConfig::Off, ThinkingConfig::Effort(Max), ThinkingConfig::Off ; "parent_off_wins_over_any_request")]
     #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Off, ThinkingConfig::Off ; "child_may_always_turn_it_off")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Off, ThinkingConfig::Off ; "child_off_beats_an_unbounded_parent")]
     #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Max) ; "parent_adaptive_is_not_a_ceiling")]
-    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "child_adaptive_passes_through")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "parent_adaptive_lets_the_child_stay_adaptive")]
+    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Minimal) ; "child_adaptive_cannot_escape_a_parent_effort")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Max) ; "child_adaptive_yields_even_to_the_top_effort")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Adaptive, ThinkingConfig::Budget(SMALL_BUDGET) ; "child_adaptive_cannot_escape_a_parent_budget")]
     #[test_case(ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Low) ; "effort_capped_at_parent")]
     #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Low) ; "effort_lower_child_kept")]
     #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "budget_capped_at_parent")]
