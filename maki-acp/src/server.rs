@@ -42,6 +42,11 @@ use tracing::{debug, info, warn};
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
+/// We advertise no auth methods, so there is no in-band `authenticate` the
+/// client could run mid-turn: the turn ends and the user re-logins out of band
+/// before prompting again.
+const AUTH_FAILED_MSG: &str =
+    "Authentication failed. Run `maki auth login`, then send the prompt again.";
 /// Turns already recorded were priced when they ran. `always_fast` is a live
 /// config value, so reading it here would reprice history the user paid for at
 /// standard rates. New turns still honour it.
@@ -409,6 +414,7 @@ fn start_session(
         session_ref.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
+        handle.cancel_tx.clone(),
         cwd,
         maki_storage::paths::home(),
         project_trusted,
@@ -749,12 +755,10 @@ fn handle_notification(srv: &Server, method: &str) {
 
 fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(session) = &srv.session else { return };
-    let Some(id) = raw.get("id").and_then(Value::as_i64) else {
-        return;
-    };
-    let ask = session.pending.lock().unwrap().asks.remove(&id);
+    let id = raw.get("id").map(request_id).unwrap_or(RequestId::Null);
+    let ask = ask_id(&id).and_then(|id| session.pending.lock().unwrap().asks.remove(&id));
     let Some(ask) = ask else {
-        warn!(id, "response for an unknown request id");
+        warn!(%id, "response for an unknown request id");
         return;
     };
     let (answer, answer_tx) = match &ask {
@@ -776,6 +780,17 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
         ),
     };
     let _ = answer_tx.unwrap_or(&session.handle.answer_tx).send(answer);
+}
+
+/// Our asks go out with a numeric id, but JSON-RPC ids are `string | number`
+/// and a client may echo ours back as a string. Dropping such a response would
+/// park the waiting tool forever.
+fn ask_id(id: &RequestId) -> Option<i64> {
+    match id {
+        RequestId::Number(id) => Some(*id),
+        RequestId::Str(id) => id.parse().ok(),
+        RequestId::Null => None,
+    }
 }
 
 /// A response we cannot read still has to answer the agent, or the tool waits
@@ -838,6 +853,7 @@ fn start_event_pump(
     session_id: SessionRef,
     out_tx: Sender<Value>,
     pending: PendingState,
+    cancel_tx: Sender<()>,
     cwd: PathBuf,
     home: Option<PathBuf>,
     project_trusted: bool,
@@ -918,6 +934,21 @@ fn start_event_pump(
                     );
                     continue;
                 }
+                // A child's auth failure parks its own agent, and the parent is
+                // blocked on that child, so this runs before subagent events
+                // are dropped.
+                AgentEvent::AuthRequired => {
+                    tool_inputs.clear();
+                    if let Some(id) = finish_turn(&pending) {
+                        let error = AcpError::auth_required().data(json_str(&AUTH_FAILED_MSG));
+                        send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
+                    }
+                    // The agent waits for a re-authentication nothing in this
+                    // protocol can deliver, and it reads no further input until
+                    // that wait ends.
+                    let _ = cancel_tx.try_send(());
+                    continue;
+                }
                 _ if subagent.is_some() => continue,
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
@@ -934,7 +965,7 @@ fn start_event_pump(
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::Done { reason, .. } => {
                     tool_inputs.clear();
-                    if let Some(id) = pending.lock().unwrap().prompt.take() {
+                    if let Some(id) = finish_turn(&pending) {
                         let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
                             &out_tx,
@@ -948,7 +979,7 @@ fn start_event_pump(
                     // and the pump outlives the session, so without this the
                     // whole file a `write` was carrying stays pinned forever.
                     tool_inputs.clear();
-                    if let Some(id) = pending.lock().unwrap().prompt.take() {
+                    if let Some(id) = finish_turn(&pending) {
                         let error = AcpError::internal_error().data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
                     }
@@ -959,6 +990,16 @@ fn start_event_pump(
             session_update(&out_tx, &sid, update);
         }
     })
+}
+
+/// Takes the client's outstanding `session/prompt`, if any. A turn only ends
+/// with nothing parked on an ask, so an ask still registered here belongs to a
+/// waiter that is already gone: it is dropped rather than left to sit in the
+/// map for the life of the session.
+fn finish_turn(pending: &PendingState) -> Option<RequestId> {
+    let mut pending = pending.lock().unwrap();
+    pending.asks.clear();
+    pending.prompt.take()
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
@@ -1286,6 +1327,10 @@ mod tests {
     const TURN_COST: f64 = 0.5;
     const CONTEXT_WINDOW: u32 = 200_000;
     const PARENT_TOOL_USE_ID: &str = "toolu_1";
+    const NEXT_PROMPT_ID: i64 = 8;
+    const PROMPT_TEXT: &str = "rename foo to bar";
+    /// A string id no ask can ever carry, since ours are minted as numbers.
+    const UNANSWERABLE_ID: &str = "not-an-id";
     const SUBAGENT_NAME: &str = "task";
     const CHILD_TOOL_USE_IDS: [&str; 2] = ["child_write_1", "child_write_2"];
     const PERMISSION_TOOL: &str = "write";
@@ -1307,6 +1352,7 @@ mod tests {
             session.handle.session_id.clone(),
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
+            session.handle.cancel_tx.clone(),
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
@@ -1316,6 +1362,16 @@ mod tests {
         feed(&sender);
         drop(guard);
         smol::block_on(pump);
+    }
+
+    fn prompt_request(srv: &Server) -> Value {
+        let session = srv.session.as_ref().expect("a session is installed");
+        serde_json::json!({
+            "params": {
+                "sessionId": session.handle.session_id.to_string(),
+                "prompt": [{ "type": "text", "text": PROMPT_TEXT }],
+            }
+        })
     }
 
     fn turn_complete(cost: f64) -> Box<TurnCompleteEvent> {
@@ -1718,6 +1774,71 @@ mod tests {
             Some((ended, SessionEndReason::Replaced))
         );
         assert!(srv.session.is_none(), "close must take the session");
+    }
+
+    /// A prompt only ever gets one response, and the client may not send the
+    /// next one until it arrives. An auth failure parks the agent on an answer
+    /// ACP cannot produce, so the turn has to end here instead.
+    #[test]
+    fn auth_required_ends_the_prompt_instead_of_parking_the_session() {
+        let (mut srv, .., out_rx) = test_server();
+        let (input_tx, input_rx) = flume::unbounded();
+        let (cancel_tx, cancel_rx) = flume::unbounded();
+        let session = srv.session.as_mut().expect("a session is installed");
+        session.handle.input_tx = input_tx;
+        session.handle.cancel_tx = cancel_tx;
+        let raw = prompt_request(&srv);
+
+        handle_prompt(&mut srv, &raw, &RequestId::Number(PROMPT_ID)).unwrap();
+        run_pump(&srv, None, |sender| {
+            sender.send(AgentEvent::AuthRequired).unwrap();
+        });
+
+        let response = out_rx.try_recv().expect("the in-flight prompt is answered");
+        assert_eq!(response["id"], PROMPT_ID);
+        assert_eq!(
+            response["error"]["code"],
+            i32::from(AcpError::auth_required().code)
+        );
+        assert_eq!(
+            response["error"]["data"], AUTH_FAILED_MSG,
+            "the client is told why the turn ended: {response}"
+        );
+        assert!(
+            cancel_rx.try_recv().is_ok(),
+            "the agent parked on re-authentication is released"
+        );
+
+        assert!(pending(&srv).lock().unwrap().prompt.is_none());
+        handle_prompt(&mut srv, &raw, &RequestId::Number(NEXT_PROMPT_ID))
+            .expect("the next prompt is accepted");
+        assert_eq!(input_rx.len(), 2, "both prompts reached the agent");
+    }
+
+    /// JSON-RPC ids are `string | number`, and a client is free to echo ours
+    /// back in either shape. An answer dropped for its shape leaves the tool
+    /// parked forever.
+    #[test_case(Value::from(ANSWERED_ID), true ; "a_numeric_id_answers_the_ask")]
+    #[test_case(Value::from(ANSWERED_ID.to_string()), true ; "a_string_id_answers_the_same_ask")]
+    #[test_case(Value::from(UNANSWERABLE_ID), false ; "an_id_matching_no_ask_answers_nothing")]
+    fn a_response_is_delivered_whatever_shape_its_id_has(id: Value, delivered: bool) {
+        let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
+
+        handle_incoming_response(
+            &srv,
+            &serde_json::json!({
+                "id": id,
+                "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } },
+            }),
+        );
+
+        let answered = TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode();
+        assert_eq!(answer_rx.try_recv().ok(), delivered.then_some(answered));
+        assert_eq!(
+            pending(&srv).lock().unwrap().asks.contains_key(&ANSWERED_ID),
+            !delivered,
+            "only the ask that was answered is retired"
+        );
     }
 
     #[test]
