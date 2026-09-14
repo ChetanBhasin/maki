@@ -202,9 +202,34 @@ pub async fn adapt_images_for_model<'a>(
     if edits.is_empty() {
         return Cow::Borrowed(messages);
     }
-    let mut adapted = messages.to_vec();
-    for (m, b, block) in edits {
-        adapted[m].content[b] = block;
+    // A settled image hands its cached verdict back, so once anything here
+    // needed repairing `edits` is non-empty on every later turn too. The owned
+    // slice a provider takes has to carry every message, so the untouched ones
+    // are still cloned, but only a message an edit lands on is rebuilt, and it
+    // is rebuilt out of the blocks it keeps rather than cloned whole and then
+    // written over. History keeps the originals on purpose: see above.
+    // The walk above ran newest-first, so reversing the edits lines them up
+    // with a single forward pass.
+    let mut edits = edits.into_iter().rev().peekable();
+    let mut adapted = Vec::with_capacity(messages.len());
+    for (m, message) in messages.iter().enumerate() {
+        if edits.peek().is_none_or(|&(edited, ..)| edited != m) {
+            adapted.push(message.clone());
+            continue;
+        }
+        let mut content = Vec::with_capacity(message.content.len());
+        for (b, block) in message.content.iter().enumerate() {
+            match edits.next_if(|&(edited, at, _)| (edited, at) == (m, b)) {
+                Some((.., replacement)) => content.push(replacement),
+                None => content.push(block.clone()),
+            }
+        }
+        adapted.push(Message {
+            role: message.role.clone(),
+            content,
+            display_text: message.display_text.clone(),
+            kind: message.kind,
+        });
     }
     Cow::Owned(adapted)
 }
@@ -1152,6 +1177,65 @@ mod tests {
             smol::block_on(adapt_images_for_model(&text_only_model, &no_images)),
             Cow::Borrowed(_)
         ));
+    }
+
+    /// A repaired image is repaired for the rest of the session, so this path
+    /// is walked on every later turn: the messages the repair does not reach
+    /// must come out of it untouched, and history must keep its own pixels.
+    #[test]
+    fn adapt_images_rebuilds_only_the_messages_that_change() {
+        const CAPTION: &str = "look";
+        const OVERSIZED: u32 = 2600;
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let fine = ImageSource::new(
+            ImageMediaType::Png,
+            Arc::from(crate::image::png_base64(32, 32)),
+        );
+        let carries = |content: Vec<ContentBlock>| Message {
+            role: Role::User,
+            content,
+            ..Default::default()
+        };
+        let history = vec![
+            Message::user(CAPTION.into()),
+            carries(vec![ContentBlock::Image {
+                source: fine.clone(),
+            }]),
+            carries(vec![
+                ContentBlock::Text {
+                    text: CAPTION.into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::new(
+                        ImageMediaType::Png,
+                        Arc::from(crate::image::png_base64(OVERSIZED, 30)),
+                    ),
+                },
+            ]),
+        ];
+
+        let adapted = smol::block_on(adapt_images_for_model(&model, &history));
+        assert!(matches!(adapted, Cow::Owned(_)), "the repair needs a copy");
+        assert_eq!(adapted[0].first_user_text(), Some(CAPTION));
+        let ContentBlock::Image { source } = &adapted[1].content[0] else {
+            panic!("an image nothing is wrong with must stay an image");
+        };
+        assert!(
+            Arc::ptr_eq(&source.data, &fine.data),
+            "an untouched image must not be re-encoded"
+        );
+        assert!(
+            matches!(&adapted[2].content[0], ContentBlock::Text { text } if text == CAPTION),
+            "the blocks beside a repaired one must survive"
+        );
+        let ContentBlock::Image { source } = &history[2].content[1] else {
+            panic!("history must keep its image block");
+        };
+        assert_eq!(
+            crate::image::dimensions(source),
+            (OVERSIZED, 30),
+            "only the copy going out is rewritten"
+        );
     }
 
     #[test]
