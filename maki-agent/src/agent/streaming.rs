@@ -22,6 +22,11 @@ const MIN_OUTPUT_TOKENS: u32 = 4096;
 /// Each round halves the ask, or lands exactly when the server quoted its own
 /// numbers, so two is enough for both. Past that the prompt is the problem.
 const MAX_BUDGET_RETRIES: u32 = 2;
+/// `AgentError::retry_message` falls back to the raw `API error (400): ...`
+/// body for an overflow, which is a paragraph of server arithmetic in a
+/// one-line status bar. The only part the user can act on is that the same
+/// turn is on its way back, asking for less.
+const BUDGET_RETRY_MESSAGE: &str = "output budget too large, retrying smaller";
 /// GPT models sometimes emit `functions.<name>`, a Codex training habit.
 /// Stripped here at the provider boundary so no raw name enters the agent;
 /// the batch plugin mirrors the rule in Lua.
@@ -203,6 +208,7 @@ pub(crate) async fn stream_with_retry(
     let floor = min_output(model);
     let mut budget = planned_output(model, opts, output_budget, prompt);
     let mut budget_retries = 0;
+    let mut attempt = 0;
     // Rebuilding images a provider would refuse can take real time on the
     // first request of a session full of screenshots, and it all happens
     // before anything below can observe a cancel.
@@ -253,67 +259,83 @@ pub(crate) async fn stream_with_retry(
             Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
             Err(e) => {
                 emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
-                let Some(kind) = e.retry_kind() else {
+                // Both arms only decide what the next attempt costs, so the one
+                // tail below is the only way round the loop and no recovery
+                // path can reach it without telling the view to drop what the
+                // dead attempt already streamed.
+                let (message, delay) = match e.retry_kind() {
                     // A budget overflow is the one rejection maki caused itself, by
                     // asking for more output than the prompt left room for. Asking
                     // for less costs nothing, so it happens here instead of falling
                     // through to the caller, whose only remedy is to summarize the
                     // session away.
-                    if let Some(
-                        overflow @ Overflow::Budget {
-                            prompt: measured, ..
-                        },
-                    ) = e.overflow()
-                    {
+                    None => {
+                        let Some(
+                            overflow @ Overflow::Budget {
+                                prompt: measured, ..
+                            },
+                        ) = e.overflow()
+                        else {
+                            return Err(e.into());
+                        };
                         // The server counted the prompt maki could only estimate.
                         if let Some(gauge) = gauge.as_deref_mut() {
                             gauge.record(measured.unwrap_or(0));
                         }
-                        if budget_retries < MAX_BUDGET_RETRIES
-                            && let Some(next) =
-                                shrunk_budget(budget, overflow, model.context_window, floor)
-                        {
-                            budget_retries += 1;
-                            warn!(
-                                model = %model.id,
-                                from = budget,
-                                to = next,
-                                measured_prompt = measured,
-                                "output budget did not fit the window, retrying smaller"
-                            );
-                            budget = next;
-                            continue;
-                        }
+                        let Some(next) = (budget_retries < MAX_BUDGET_RETRIES)
+                            .then(|| shrunk_budget(budget, overflow, model.context_window, floor))
+                            .flatten()
+                        else {
+                            return Err(e.into());
+                        };
+                        budget_retries += 1;
+                        warn!(
+                            model = %model.id,
+                            from = budget,
+                            to = next,
+                            measured_prompt = measured,
+                            "output budget did not fit the window, retrying smaller"
+                        );
+                        budget = next;
+                        (BUDGET_RETRY_MESSAGE.to_owned(), Duration::ZERO)
                     }
-                    return Err(e.into());
+                    Some(kind) => {
+                        if e.should_rotate_key()
+                            && let Ok(true) = provider.rotate_key().await
+                        {
+                            warn!("rotated API key after error: {e}");
+                        }
+                        let Some(delay) = retry.next_delay(kind, e.retry_after()) else {
+                            return Err(e.into());
+                        };
+                        (e.retry_message(), delay)
+                    }
                 };
-                if e.should_rotate_key()
-                    && let Ok(true) = provider.rotate_key().await
-                {
-                    warn!("rotated API key after error: {e}");
-                }
-                let Some(delay) = retry.next_delay(kind, e.retry_after()) else {
-                    return Err(e.into());
-                };
-                let attempt = retry.attempts();
+                // A budget retry spends none of the retry budget, so
+                // `retry.attempts()` stands still across it. The status bar
+                // numbers every wait it shows, and a number that repeats or
+                // walks backwards reads as a stuck run.
+                attempt += 1;
                 let delay_ms = delay.as_millis() as u64;
                 warn!(attempt, delay_ms, error = %e, "retryable, will retry");
                 event_tx.send(AgentEvent::Retry {
                     attempt,
-                    message: e.retry_message(),
+                    message,
                     delay_ms,
                 })?;
-                futures_lite::future::race(
-                    async {
-                        smol::Timer::after(delay).await;
-                    },
-                    cancel.cancelled(),
-                )
-                .await;
-                if cancel.is_cancelled() {
-                    return Err(StreamError::Cancelled {
-                        streamed: String::new(),
-                    });
+                if !delay.is_zero() {
+                    futures_lite::future::race(
+                        async {
+                            smol::Timer::after(delay).await;
+                        },
+                        cancel.cancelled(),
+                    )
+                    .await;
+                    if cancel.is_cancelled() {
+                        return Err(StreamError::Cancelled {
+                            streamed: String::new(),
+                        });
+                    }
                 }
             }
         }
@@ -640,9 +662,9 @@ mod tests {
         server: &StrictServer,
         model: &Model,
         gauge: &mut ContextGauge,
-    ) -> Result<StreamResponse, StreamError> {
-        let (tx, _rx) = flume::unbounded();
-        stream_with_retry(
+    ) -> (Result<StreamResponse, StreamError>, Vec<AgentEvent>) {
+        let (tx, rx) = flume::unbounded();
+        let result = stream_with_retry(
             StreamRequest {
                 provider: server,
                 model,
@@ -658,7 +680,49 @@ mod tests {
             &EventSender::new(tx, 0),
             &CancelToken::none(),
         )
-        .await
+        .await;
+        (result, rx.try_iter().map(|e| e.event).collect())
+    }
+
+    fn retries_of(events: &[AgentEvent]) -> Vec<(u32, &str, u64)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Retry {
+                    attempt,
+                    message,
+                    delay_ms,
+                } => Some((*attempt, message.as_str(), *delay_ms)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const FIRST_ATTEMPT: u32 = 1;
+    const NO_WAIT: u64 = 0;
+
+    /// `AgentEvent::Retry` is the only thing that makes the view drop what the
+    /// refused attempt already streamed, so a budget retry that shrinks the ask
+    /// silently leaves the dead attempt's text on screen for the answer that
+    /// replaces it to be appended to.
+    #[test_case(STRICT_WINDOW, &[] ; "a_request_that_fits_reports_nothing")]
+    #[test_case(CROWDED_WINDOW, &[(FIRST_ATTEMPT, BUDGET_RETRY_MESSAGE, NO_WAIT)] ; "a_shrunk_budget_is_reported_like_any_other_retry")]
+    fn every_way_round_the_loop_tells_the_view_to_start_over(
+        window: u32,
+        expected: &[(u32, &str, u64)],
+    ) {
+        smol::block_on(async {
+            let server = StrictServer {
+                window,
+                requests: Mutex::default(),
+            };
+            let mut gauge = ContextGauge::default();
+
+            let (result, events) = send(&server, &strict_model(window), &mut gauge).await;
+
+            result.expect("a shrunk budget is answered");
+            assert_eq!(retries_of(&events), expected);
+        });
     }
 
     #[test_case(STRICT_WINDOW, 1 ; "a_window_sized_cap_still_leaves_room_for_the_prompt")]
@@ -675,6 +739,7 @@ mod tests {
 
             let response = send(&server, &strict_model(window), &mut gauge)
                 .await
+                .0
                 .expect("a flat budget leaves the window room for the prompt");
 
             let asks = server.requests.lock().unwrap().clone();
