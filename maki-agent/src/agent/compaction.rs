@@ -7,6 +7,7 @@ use maki_providers::{
     StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
+use serde_json::Value;
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
@@ -192,12 +193,17 @@ fn finish_compact(
     Ok(response.usage)
 }
 
+/// `system` and `tools` are the ones the next request will carry: compaction
+/// replaces the transcript and leaves that baseline untouched, so the gauge
+/// cannot be resized without them.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
     history: &mut History,
     gauge: &mut ContextGauge,
+    system: &str,
+    tools: &Value,
     event_tx: &EventSender,
     config: &AgentConfig,
     instructions: Option<&str>,
@@ -222,7 +228,7 @@ pub async fn compact(
     if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
         history.push(Message::synthetic(post.to_string()));
     }
-    gauge.reset(history.as_slice());
+    gauge.reset(history.as_slice(), system, tools);
 
     // The summariser read a subset of the session's prompt, so its own count is
     // a floor on the size before, and the only number a gauge that has not seen
@@ -388,6 +394,13 @@ mod tests {
     const OLD_RESULT: &str = "old";
     const NEW_RESULT: &str = "new result";
     const KEPT_TEXT: &str = "keep me";
+    /// These tests assert on the transcript and on gauge sizes relative to each
+    /// other, so the baseline would only add noise.
+    const NO_SYSTEM: &str = "";
+
+    fn no_tools() -> Value {
+        Value::Array(Vec::new())
+    }
 
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
@@ -474,6 +487,8 @@ mod tests {
             &default_model(),
             history,
             gauge,
+            NO_SYSTEM,
+            &no_tools(),
             &EventSender::new(raw_tx, 0),
             config,
             instructions,

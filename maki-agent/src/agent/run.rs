@@ -260,7 +260,7 @@ impl<'h> Agent<'h> {
         self.gauge.seed_if_empty(
             self.history.as_slice(),
             &self.system,
-            Self::request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
+            request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
         );
 
         // Every frontend enters here, so busy time is measured here; a turn
@@ -309,28 +309,11 @@ impl<'h> Agent<'h> {
         }
     }
 
-    /// `tools` holds base tools only. The MCP part is recomputed here every
-    /// turn, so `tool_search` loads and late-connecting servers take effect on
-    /// the next request.
-    ///
-    /// Takes the two fields rather than `&self`, so a caller can hold the
-    /// result and still reach `&mut self.gauge`.
-    fn request_tools<'t>(tools: &'t RequestTools, mcp: Option<&McpSession>) -> Cow<'t, Value> {
-        match mcp {
-            Some(mcp) => {
-                let mut tools = tools.definitions().clone();
-                mcp.extend_tools(&mut tools);
-                Cow::Owned(tools)
-            }
-            None => Cow::Borrowed(tools.definitions()),
-        }
-    }
-
     async fn turn(&mut self) -> Result<TurnOutcome, AgentError> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let tools = Self::request_tools(&self.tools, self.mcp.as_ref());
+        let tools = request_tools(&self.tools, self.mcp.as_ref());
         let response = match stream_with_retry(
             StreamRequest {
                 provider: &*self.provider,
@@ -649,7 +632,11 @@ impl<'h> Agent<'h> {
             .add(compaction_usage, compact_cost, compact_list_cost);
         // The measurement the gauge holds describes the transcript that was
         // just summarized away, so what is left is all it may count.
-        self.gauge.reset(self.history.as_slice());
+        self.gauge.reset(
+            self.history.as_slice(),
+            &self.system,
+            request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
+        );
         let context_size_after = self.gauge.size();
         let carry_from = self.history.len().saturating_sub(carry_len);
         self.rollback_len = carry_from;
@@ -703,6 +690,24 @@ impl<'h> Agent<'h> {
         Ok(true)
     }
 }
+
+/// `tools` holds base tools only. The MCP part is recomputed per request, so
+/// `tool_search` loads and late-connecting servers take effect on the next one.
+///
+/// Free-standing rather than a method, so a caller can hold the result and
+/// still reach `&mut self.gauge`, and so a frontend sizing the same prompt
+/// outside a run does not rebuild the array by hand.
+pub fn request_tools<'t>(tools: &'t RequestTools, mcp: Option<&McpSession>) -> Cow<'t, Value> {
+    match mcp {
+        Some(mcp) => {
+            let mut tools = tools.definitions().clone();
+            mcp.extend_tools(&mut tools);
+            Cow::Owned(tools)
+        }
+        None => Cow::Borrowed(tools.definitions()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

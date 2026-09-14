@@ -193,11 +193,19 @@ impl AgentLoop {
             self.timeouts,
             &self.model_policy,
         );
+        // Compaction resizes the gauge, and the gauge has to describe the whole
+        // next prompt. A standalone `/compact` has no mode of its own, so this
+        // is the same Build-mode prompt `publish_btw_system` builds from the
+        // vars, instructions and slots a run would use.
+        let system = self.system_prompt(&self.lua_handle.collect_prompt_slots_async().await);
+        let tools = agent::request_tools(&self.tools, self.mcp.as_ref());
         agent::compact(
             &*provider,
             &model,
             &mut self.history,
             &mut self.gauge,
+            &system,
+            &tools,
             event_tx,
             &self.config,
             instructions,
@@ -332,18 +340,22 @@ impl AgentLoop {
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
     }
 
-    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
-    /// the model. Everything else matches the live prompt.
     fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
-        let slot = self.model_slot.load();
-        let system = agent::build_system_prompt(
+        self.btw_system
+            .store(Arc::new(self.system_prompt(prompt_slots)));
+    }
+
+    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
+    /// the model, and a gauge sizing this only cares about the length. Everything else matches
+    /// the live prompt.
+    fn system_prompt(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) -> String {
+        agent::build_system_prompt(
             &self.vars,
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,
-            &slot.model,
-        );
-        self.btw_system.store(Arc::new(system));
+            &self.model_slot.load().model,
+        )
     }
 
     fn set_cancel_trigger(&self, run_id: u64, trigger: CancelTrigger) {
