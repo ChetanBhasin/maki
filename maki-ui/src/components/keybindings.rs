@@ -241,6 +241,8 @@ pub enum KeyLabel {
 }
 
 pub const ALT_SEP: &str = " / ";
+pub const ESC_ESC_LABEL: &str = "Esc Esc";
+pub const CANCEL_AGENT_DESC: &str = "Cancel agent";
 
 #[derive(Debug, Clone, Copy)]
 pub enum ResolvedLabel {
@@ -456,7 +458,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("Esc Esc"),
+        label: KeyLabel::Single(ESC_ESC_LABEL),
         description: "Rewind",
         context: KeybindContext::Editing,
         platform: Platform::All,
@@ -474,8 +476,8 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("Esc Esc"),
-        description: "Cancel agent",
+        label: KeyLabel::Single(key::QUIT.label),
+        description: CANCEL_AGENT_DESC,
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },
