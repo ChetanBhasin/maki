@@ -468,14 +468,14 @@ impl PermissionManager {
         // Plan file auto-allow: fires AFTER deny rules have been evaluated.
         // Only triggers if ALL pending scopes match the plan file path.
         // A single non-plan scope means we must prompt for the rest.
+        // Compared the way the write lands: `link/../plan.md` is the plan
+        // file lexically but somewhere else once `link` is followed.
         if !force_prompt && !pending.is_empty() {
             let is_plan_write = plan_path.is_some_and(|pp| {
                 matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
                     && {
-                        let normalized_plan = normalize_scope_path(&pp.display().to_string());
-                        pending
-                            .iter()
-                            .all(|s| normalize_scope_path(s) == normalized_plan)
+                        let plan = normalize_scope_prefix(pp);
+                        pending.iter().all(|s| normalize_scope_prefix(s) == plan)
                     }
             });
             if is_plan_write {
@@ -879,18 +879,6 @@ pub fn scope_matches(pattern: &str, value: &str) -> bool {
     pattern == value
 }
 
-/// Lexical normalization for scope paths. Resolves `..` and `.` without
-/// hitting the filesystem and without producing `\\?\` prefixes on Windows.
-/// Use this for display, logging, and scope matching.
-///
-/// For symlink-aware security checks, use [`physical_boundary_check`].
-pub fn normalize_scope_path(path: &str) -> String {
-    let resolved = crate::tools::resolve_path(path).unwrap_or_else(|_| path.to_string());
-    maki_storage::paths::normalize_path(Path::new(&resolved))
-        .to_string_lossy()
-        .into_owned()
-}
-
 /// Check whether `child` is physically inside `parent`, following symlinks.
 ///
 /// Uses incremental left-to-right canonicalization: each component is
@@ -981,7 +969,6 @@ mod tests {
     const TEST_CWD: &str = "/tmp";
     const MCP_SERVER: &str = "deepwiki";
     const MCP_TOOL: &str = "deepwiki.search";
-    #[cfg(unix)]
     const MCP_ARGS: &str = "{\"q\":\"maki\"}";
     const READ_TOOL: &str = "read";
     const READ_SCOPE: &str = "/home/user/project/src/main.rs";
@@ -994,6 +981,7 @@ mod tests {
     const PROMPTS: &str = "prompts";
     const PROJECT_DIR: &str = ".maki";
     const PROJECT_PERMISSIONS: &str = ".maki/permissions.toml";
+    #[cfg(unix)]
     const OUTSIDE_WRITES: [&str; 2] = ["/etc/passwd", "~/.bashrc"];
     const OUTSIDE_SCOPES: [&str; 3] = ["/etc/passwd", "~/.bashrc", "cargo test"];
 
@@ -1103,7 +1091,6 @@ mod tests {
         assert!(is_universal_scope(&format!("{}/**", link.display())));
         assert_universal_invariant(&format!("{}/**", link.display()));
     }
-    #[cfg(unix)]
 
     fn matches_everything(pattern: &str) -> bool {
         OUTSIDE_SCOPES.iter().all(|s| scope_matches(pattern, s))
@@ -1112,11 +1099,11 @@ mod tests {
     fn assert_universal_invariant(pattern: &str) {
         assert!(
             !matches_everything(pattern) || is_universal_scope(pattern),
-    #[cfg(unix)]
             "{pattern:?} matches everything but a plugin allow for it would not be refused"
         );
     }
 
+    #[cfg(unix)]
     fn normal_depth(path: &Path) -> usize {
         path.components()
             .filter(|c| matches!(c, Component::Normal(_)))
@@ -1125,6 +1112,7 @@ mod tests {
 
     /// Enough `..` after `path` to reach the root lexically, whatever the
     /// filesystem makes of them.
+    #[cfg(unix)]
     fn climb_to_lexical_root(path: &Path) -> String {
         format!("{}{}", path.display(), "/..".repeat(normal_depth(path)))
     }
@@ -1334,9 +1322,8 @@ mod tests {
 
     #[test]
     fn path_traversal_prompts() {
-        let path = normalize_scope_path("/tmp/../etc/passwd");
         assert!(matches!(
-            default_mgr().check(&ToolKey::native("write"), &path, None),
+            default_mgr().check(&ToolKey::native("write"), "/tmp/../etc/passwd", None),
             PermissionCheck::NeedsPrompt { .. }
         ));
     }
@@ -2210,5 +2197,36 @@ mod tests {
             ),
             PermissionCheck::NeedsPrompt { .. }
         ));
+    }
+
+    /// `away/..` spells the plan file, but `away` is a symlink, so the write
+    /// lands beside its target instead. A symlinked spelling of the plan file
+    /// itself still is the plan file.
+    #[test]
+    #[cfg(unix)]
+    fn plan_auto_allow_follows_symlinks_like_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let plans = dir.path().join("plans");
+        let elsewhere = dir.path().join("elsewhere/deep");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, plans.join("away")).unwrap();
+        std::os::unix::fs::symlink(&plans, dir.path().join("alias")).unwrap();
+        let plan = plans.join("plan.md");
+        let mgr = mgr_with(PermissionsConfig::default(), cwd.path().to_path_buf());
+        let write = ToolKey::native("write");
+
+        for (scope, expected) in [
+            (plans.join("away/../plan.md"), PROMPTS),
+            (dir.path().join("alias/plan.md"), ALLOWED),
+        ] {
+            let scope = scope.to_string_lossy();
+            assert_eq!(
+                outcome(mgr.check(&write, &scope, Some(&plan))),
+                expected,
+                "{scope}"
+            );
+        }
     }
 }
