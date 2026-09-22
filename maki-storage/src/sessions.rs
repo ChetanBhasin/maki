@@ -2090,6 +2090,25 @@ where
         Self::claim_and_load_from(id, dir).map(Some)
     }
 
+    /// The session `--continue` points at, claiming nothing. For a run that
+    /// writes somewhere else and only needs to know what to copy.
+    pub fn latest_id(cwd: &str, dir: &StateDir) -> Result<Option<MakiId>, SessionError> {
+        latest_id_in(cwd, &dir.ensure_subdir(SESSIONS_DIR)?)
+    }
+
+    /// Reads a session another process may be writing, to copy it. Takes no
+    /// lock and never writes: a legacy file stays for its owner to migrate, and
+    /// a torn last line is dropped in memory like on any load.
+    pub fn read_only(id: MakiId, dir: &StateDir) -> Result<Self, SessionError> {
+        Self::read_only_from(id, &dir.path().join(SESSIONS_DIR))
+    }
+
+    pub fn read_only_from(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
+        let path =
+            locate_session_file(dir, id).ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+        load_session_at(&path)
+    }
+
     pub fn update_title_if_default(&mut self) {
         if self.title == DEFAULT_TITLE {
             self.set_title(generate_title(&self.messages));
@@ -3250,6 +3269,29 @@ mod tests {
             SessionClaim::acquire_in(session.id, dir).is_err(),
             "{READ_UNDER_CLAIM}"
         );
+    }
+
+    /// Copying a session must not touch it, whoever holds it. A plain load
+    /// would migrate this legacy file in place.
+    #[test_case(false ; "a free session")]
+    #[test_case(true ; "a session another process holds")]
+    fn read_only_leaves_the_file_as_it_found_it(held_elsewhere: bool) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.id = id;
+        session.push_message(user_message("legacy"));
+        let legacy_path = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
+        write_legacy_jsonl(&legacy_path, &session);
+        let before = fs::read(&legacy_path).unwrap();
+        let _elsewhere = held_elsewhere.then(|| claim_id(dir, id));
+
+        let read = TestSession::read_only_from(id, dir).unwrap();
+
+        assert_eq!(read.messages().len(), 1);
+        assert_eq!(fs::read(&legacy_path).unwrap(), before);
+        assert!(!jsonl_path(dir, id).exists());
     }
 
     /// Unlinking the lock while another holder still writes the id would let a
