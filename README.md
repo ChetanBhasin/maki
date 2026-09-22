@@ -64,6 +64,8 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 **Dynamic providers** - drop an executable script into `~/.config/maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
 
+> Providers as Lua plugins WIP!
+
 ## Installation
 
 ### Linux / macOS
