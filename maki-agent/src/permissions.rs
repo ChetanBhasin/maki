@@ -981,6 +981,7 @@ mod tests {
     const TEST_CWD: &str = "/tmp";
     const MCP_SERVER: &str = "deepwiki";
     const MCP_TOOL: &str = "deepwiki.search";
+    #[cfg(unix)]
     const MCP_ARGS: &str = "{\"q\":\"maki\"}";
     const READ_TOOL: &str = "read";
     const READ_SCOPE: &str = "/home/user/project/src/main.rs";
@@ -1102,6 +1103,7 @@ mod tests {
         assert!(is_universal_scope(&format!("{}/**", link.display())));
         assert_universal_invariant(&format!("{}/**", link.display()));
     }
+    #[cfg(unix)]
 
     fn matches_everything(pattern: &str) -> bool {
         OUTSIDE_SCOPES.iter().all(|s| scope_matches(pattern, s))
@@ -1110,6 +1112,7 @@ mod tests {
     fn assert_universal_invariant(pattern: &str) {
         assert!(
             !matches_everything(pattern) || is_universal_scope(pattern),
+    #[cfg(unix)]
             "{pattern:?} matches everything but a plugin allow for it would not be refused"
         );
     }
