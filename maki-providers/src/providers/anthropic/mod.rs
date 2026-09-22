@@ -642,6 +642,7 @@ mod tests {
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
+    const THINKING_SIGNATURE: &str = "sig";
 
     const USAGE_BODY: &str = r#"{
         "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
@@ -956,6 +957,13 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
     fn thinking_block(thinking: &str) -> ContentBlock {
         ContentBlock::Thinking {
             thinking: thinking.into(),
+            signature: Some(THINKING_SIGNATURE.into()),
+        }
+    }
+
+    fn unsigned_thinking_block(thinking: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: thinking.into(),
             signature: None,
         }
     }
@@ -1031,6 +1039,31 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         assert_eq!(json[0]["content"][0]["text"], "kept");
         assert_eq!(json[1]["content"].as_array().unwrap().len(), 1);
         assert_eq!(json[1]["content"][0]["text"], EMPTY_RESPONSE_MARKER);
+    }
+
+    #[test_case(
+        vec![unsigned_thinking_block("summary"), text_block("reply")],
+        json!([{"type": "text", "text": "reply"}])
+        ; "unsigned_thinking_dropped"
+    )]
+    #[test_case(
+        vec![thinking_block("hmm"), text_block("reply")],
+        json!([
+            {"type": "thinking", "thinking": "hmm", "signature": THINKING_SIGNATURE},
+            {"type": "text", "text": "reply"},
+        ])
+        ; "signed_thinking_kept"
+    )]
+    #[test_case(
+        vec![unsigned_thinking_block("summary")],
+        json!([{"type": "text", "text": EMPTY_RESPONSE_MARKER}])
+        ; "only_unsigned_thinking_falls_back"
+    )]
+    fn wire_messages_replay_only_signed_thinking(content: Vec<ContentBlock>, expected: Value) {
+        let messages = vec![message(Role::Assistant, content)];
+        let json: Value = serde_json::to_value(shared::wire_messages(&messages)).unwrap();
+
+        assert_eq!(json[0]["content"], expected);
     }
 
     #[test]
