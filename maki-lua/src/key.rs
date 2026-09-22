@@ -195,8 +195,12 @@ pub fn is_reserved(key: KeyEvent) -> bool {
 /// 2. With `CONTROL`, a letter is lowercase and shift stays a bit, like vim:
 ///    `<C-N>` is `<C-n>`, but `<C-S-n>` is its own key.
 /// 3. Without `CONTROL`, the letter's case is the shift, so the bit goes:
-///    `<S-a>`, `<S-A>`, `A` and a terminal's `A + SHIFT` are all `A`. A char
-///    with no case, like a digit, keeps the bit: `<S-1>`.
+///    `<S-a>`, `<S-A>`, `A` and a terminal's `A + SHIFT` are all `A`.
+/// 4. Without `CONTROL` or `ALT`, the char is the text the key typed, which
+///    already holds the shift, so a caseless char drops the bit too. Windows
+///    sends Shift+1 as `! + SHIFT` and every other terminal as `!`, and
+///    both are `!`. `<S-Space>` is `<Space>`. With `ALT` it keeps the bit:
+///    `<M-S-1>`.
 fn normalize(code: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
     let mut code = match code {
         KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
@@ -208,18 +212,20 @@ fn normalize(code: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyModifie
     if let KeyCode::Char(c) = code {
         if modifiers.contains(KeyModifiers::CONTROL) {
             code = KeyCode::Char(single(c.to_lowercase()).unwrap_or(c));
-        } else if modifiers.contains(KeyModifiers::SHIFT)
-            && let Some(upper) = shifted(c)
-        {
-            code = KeyCode::Char(upper);
-            modifiers.remove(KeyModifiers::SHIFT);
+        } else if modifiers.contains(KeyModifiers::SHIFT) {
+            if let Some(upper) = shifted(c) {
+                code = KeyCode::Char(upper);
+                modifiers.remove(KeyModifiers::SHIFT);
+            } else if !modifiers.contains(KeyModifiers::ALT) {
+                modifiers.remove(KeyModifiers::SHIFT);
+            }
         }
     }
     (code, modifiers)
 }
 
 /// {c} with shift applied, when it has case. `ß` uppercases to two chars, so
-/// it keeps the shift bit instead.
+/// it counts as caseless.
 fn shifted(c: char) -> Option<char> {
     if c.is_uppercase() {
         return Some(c);
@@ -395,6 +401,20 @@ mod tests {
         }
     }
 
+    /// Windows sets `SHIFT` on every key, while other terminals leave it out
+    /// once the char carries it. A text field inserts only plain chars, so
+    /// both have to be the char typed, or Windows users cannot type `!`.
+    #[test_case('!' ; "symbol")]
+    #[test_case(' ' ; "space")]
+    #[test_case('1' ; "digit")]
+    #[test_case('ß' ; "letter_without_a_single_uppercase")]
+    fn a_caseless_char_has_one_identity_however_shift_is_reported(c: char) {
+        let key = |mods| Key::from_event(event(KeyCode::Char(c), mods)).unwrap();
+        assert_eq!(key(SHIFT), key(NONE));
+        assert_ne!(key(CONTROL | SHIFT), key(CONTROL), "ctrl keeps the bit");
+        assert_ne!(key(ALT | SHIFT), key(ALT), "alt keeps the bit");
+    }
+
     #[test_case(KeyCode::Tab, SHIFT ; "shift_tab_on_a_kitty_terminal")]
     #[test_case(KeyCode::BackTab, NONE ; "shift_tab_everywhere_else")]
     #[test_case(KeyCode::BackTab, SHIFT ; "back_tab_already_carrying_shift")]
@@ -402,6 +422,7 @@ mod tests {
     #[test_case(KeyCode::Char('n'), CONTROL.union(SHIFT) ; "ctrl_shift_letter")]
     #[test_case(KeyCode::Char('A'), SHIFT ; "shift_upper_letter")]
     #[test_case(KeyCode::Char('1'), SHIFT ; "shift_digit")]
+    #[test_case(KeyCode::Char('!'), ALT.union(SHIFT) ; "alt_shift_symbol")]
     #[test_case(KeyCode::Char(' '), CONTROL ; "ctrl_space")]
     #[test_case(KeyCode::F(24), ALT ; "alt_f24")]
     #[test_case(KeyCode::Enter, NONE ; "plain_enter")]
@@ -422,7 +443,9 @@ mod tests {
     #[test_case(KeyCode::Char('N'), CONTROL, "<C-n>" ; "ctrl_letter_is_lowercased")]
     #[test_case(KeyCode::Char(' '), CONTROL, "<C-Space>" ; "ctrl_space")]
     #[test_case(KeyCode::Char('A'), SHIFT, "A" ; "shift_is_already_in_the_letter")]
-    #[test_case(KeyCode::Char('1'), SHIFT, "<S-1>" ; "shift_digit_keeps_its_bit")]
+    #[test_case(KeyCode::Char('!'), SHIFT, "!" ; "shift_is_already_in_the_symbol")]
+    #[test_case(KeyCode::Char(' '), SHIFT, "<Space>" ; "shift_space")]
+    #[test_case(KeyCode::Char('1'), ALT.union(SHIFT), "<M-S-1>" ; "alt_shift_digit_keeps_its_bit")]
     #[test_case(KeyCode::Char('x'), ALT, "<M-x>" ; "alt_is_printed_as_m")]
     #[test_case(KeyCode::Home, ALT, "<M-Home>" ; "alt_home")]
     #[test_case(KeyCode::F(13), NONE, "<F13>" ; "f13")]
@@ -438,6 +461,9 @@ mod tests {
     #[test_case("<C-T>", KeyCode::Char('t'), CONTROL ; "ctrl_upper_is_one_key_with_ctrl_lower")]
     #[test_case("<S-a>", KeyCode::Char('A'), NONE ; "shift_letter_is_the_uppercase_letter")]
     #[test_case("<M-S-a>", KeyCode::Char('A'), ALT ; "alt_shift_letter")]
+    #[test_case("<S-!>", KeyCode::Char('!'), NONE ; "shift_symbol_is_the_symbol")]
+    #[test_case("<S-Space>", KeyCode::Char(' '), NONE ; "shift_space_is_space")]
+    #[test_case("<M-S-1>", KeyCode::Char('1'), ALT.union(SHIFT) ; "alt_shift_digit")]
     #[test_case("<", KeyCode::Char('<'), NONE ; "bare_angle_bracket")]
     fn parse_cases(input: &str, code: KeyCode, mods: KeyModifiers) {
         let key = Key::parse(input).unwrap();

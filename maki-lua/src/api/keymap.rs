@@ -544,8 +544,10 @@ lua_table! {
     /// Terminals report some keys differently, so maki picks one form:
     ///
     /// - Control plus a letter is lowercase: `<C-N>` is `<C-n>`, as in Vim.
-    /// - Shift plus a letter is the uppercase letter: `<S-a>` is `A`. Shift
-    ///   plus a digit or punctuation keeps the prefix: `<S-1>`.
+    /// - Shift plus a letter is the uppercase letter: `<S-a>` is `A`.
+    /// - Without control or alt, shift is part of the char typed, so the key
+    ///   is that char: Shift+1 on a US layout is `!`, and `<S-!>` is `!`.
+    ///   `<S-Space>` is `<Space>`. With alt the prefix stays: `<M-S-1>`.
     /// - Shift+Tab is always `<S-Tab>`, with or without the kitty keyboard
     ///   protocol.
     ///
