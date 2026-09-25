@@ -35,6 +35,8 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // `coding_plan_context_window`, so they are not listed here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
@@ -49,7 +51,7 @@ const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 // The backend hides models newer than this Codex CLI version, so bump it when
 // a fresh model is missing from the list.
-const CODEX_CLIENT_VERSION: &str = "0.153.4";
+const CODEX_CLIENT_VERSION: &str = "0.157.0";
 const PLAN_MODELS_PATH: &str = "/models?client_version=";
 const LISTED_VISIBILITY: &str = "list";
 const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
@@ -631,14 +633,18 @@ mod tests {
     use super::*;
     use crate::ThinkingConfig;
 
+    #[test_case("gpt-6-sol")]
+    #[test_case("gpt-6-luna")]
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]
     #[test_case("gpt-5.6-sol")]
-    fn gpt_5_6_models_use_coding_plan(model_id: &str) {
+    fn named_models_use_coding_plan(model_id: &str) {
         assert!(is_codex_model(model_id));
     }
 
     #[test_case("gpt-6-astra", Some(272_000))]
+    #[test_case("gpt-6-sol", Some(272_000))]
+    #[test_case("gpt-6-luna", Some(272_000))]
     #[test_case("gpt-5.6-luna", Some(372_000))]
     #[test_case("gpt-5.6-terra", Some(372_000))]
     #[test_case("gpt-5.6-sol", Some(372_000))]
@@ -687,6 +693,8 @@ mod tests {
     fn plan_models_have_a_reviewed_dialect() {
         const EXPECTED: &[(&str, &EffortDialect)] = &[
             ("gpt-6-astra", &dialect::GPT_6),
+            ("gpt-6-sol", &dialect::GPT_6),
+            ("gpt-6-luna", &dialect::GPT_6),
             ("gpt-5.6-luna", &dialect::GPT_5_6),
             ("gpt-5.6-terra", &dialect::GPT_5_6),
             ("gpt-5.6-sol", &dialect::GPT_5_6),
